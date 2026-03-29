@@ -1,0 +1,419 @@
+---
+title: "TOPIC 1"
+author: "Flavie Bertrand and Johanna Rakotovao"
+date: "2025-11-10"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+
+```
+
+
+# Data managing
+
+## Import data 
+
+```{r}
+getwd()
+citic300 <- read.csv("C:/Users/flavi/OneDrive/Documents/ENSIIE/Eco/S&P_CITIC300 Historical Data.csv")
+sp500 <- read.csv("C:/Users/flavi/OneDrive/Documents/ENSIIE/Eco/S&P 500 Historical Data.csv")
+head(sp500)
+head(citic300)
+dim(sp500)
+dim(citic300)
+```
+
+## Merge data
+
+Modify names of the variables :
+```{r}
+# For the US
+sp500new<-sp500
+sp500new$price_us<-sp500new$Price
+sp500new$open_us<-sp500new$Open
+sp500new$high_us<-sp500new$High
+sp500new$low_us<-sp500new$Low
+sp500new$vol_us<-sp500new$Vol.
+sp500new$change_us<-sp500new$Change..
+sp500new<-subset(sp500new, select = -c(Price, Open, High, Low, Vol., Change..))
+head(sp500new)
+
+# For China
+citic300new<-citic300
+citic300new$price_china<-citic300new$Price
+citic300new$open_china<-citic300new$Open
+citic300new$high_china<-citic300new$High
+citic300new$low_china<-citic300new$Low
+citic300new$vol_china<-citic300new$Vol.
+citic300new$change_china<-citic300new$Change..
+citic300new<-subset(citic300new, select = -c(Price, Open, High, Low, Vol., Change..))
+head(citic300new)
+```
+
+Merge the two dataset :
+```{r}
+sp500new <- sp500new[order(sp500new$Date), ]
+citic300new <- citic300new[order(citic300new$Date), ]
+merged <- merge(sp500new, citic300new, by = "Date")
+merged <- merged[order(merged$Date), ]
+head(merged)
+str(merged)
+dim(merged)
+```
+
+## Cleaning data
+
+```{r}
+# Good format for date
+merged$Date <- mdy(merged$Date)
+merged <- merged[order(merged$Date), ]
+head(merged)
+
+# Cleaning price : replace the comma with nothing
+merged$price_us = as.numeric(gsub(",", "", merged$price_us))
+merged$price_china = as.numeric(gsub(",", "", merged$price_china))
+
+# Cleaning of the change of %
+merged$change_us = as.numeric(gsub("%", "", merged$change_us)) / 100
+merged$change_china = as.numeric(gsub("%", "", merged$change_china)) / 100
+
+head(merged)
+str(merged)
+dim(merged)
+rownames(merged) <- NULL
+head(merged)
+dim(merged)
+
+data_final<-subset(merged, select = c(Date, price_us, price_china, change_us, change_china))
+view(data_final)
+head(data_final)
+```
+
+
+# Computation of the volatility
+
+## Compute the log return
+
+```{r}
+data_final_log <- data_final %>%
+  arrange(Date) %>%
+  mutate(
+    log_ret_us = c(NA, diff(log(price_us))),
+    log_ret_china = c(NA, diff(log(price_china)))
+  ) %>%
+  filter(!is.na(log_ret_us) & !is.na(log_ret_china))
+
+head(data_final_log)
+```
+
+
+## Separation of the periods
+
+```{r}
+pre_pandemic <- subset(data_final_log, Date >= "2015-01-01" & Date < "2020-01-01")
+post_pandemic <- subset(data_final_log, Date >= "2020-01-01" & Date <= "2024-12-31")
+
+# Convert Date and filter by period
+data_final_log$Date <- as.Date(data_final_log$Date, format="%d/%m/%Y")
+
+# Split pre- and post-COVID periods
+data_pre  <- subset(data_final_log, Date >= "2015-01-01" & Date < "2020-01-01")
+data_post <- subset(data_final_log, Date >= "2020-01-01" & Date <= "2024-12-31")
+
+# Extract log returns
+r_us_pre  <- data_pre$log_ret_us
+r_us_post <- data_post$log_ret_us
+r_ch_pre  <- data_pre$log_ret_china
+r_ch_post <- data_post$log_ret_china
+```
+
+
+
+
+## Use of GARCH(1,1) model to compute volatility
+
+
+In financial data, volatility is not stable over time, and that is why we need to use a GARCH(1,1) model to compute the volatility. The volatility is time-varying.
+
+In a GARCH(1,1) model, we have this :
+
+- $\epsilon_t = \sigma_t Z_t$
+
+- $\sigma_t^2 = \omega + \alpha \epsilon_{t-1}^2 + \beta \sigma_{t-1}^2$
+
+Where :
+
+- $\sigma_t^2$ is the conditional variance, so the volatility at time t give, the past
+
+- $\alpha$ : impact of a return on the forthcoming volatility
+
+- $\beta$ : memory effect on the volatility
+
+```{r}
+# Function to compute conditional variance and log-likelihood
+garch11_loglik <- function(params, returns) {
+  omega <- params[1]
+  alpha <- params[2]
+  beta  <- params[3]
+  
+  n <- length(returns)
+  sigma2 <- rep(var(returns), n)
+  eps2 <- returns^2
+  
+  # Recursively compute conditional variance
+  for (t in 2:n) {
+    sigma2[t] <- omega + alpha * eps2[t-1] + beta * sigma2[t-1]
+  }
+  
+  # Compute conditional log-likelihood
+  loglik <- -0.5 * sum(log(2 * pi) + log(sigma2) + eps2 / sigma2)
+  return(-loglik)  # negative for minimization
+}
+
+# Estimate manually
+init <- c(omega = 0.0001, alpha = 0.05, beta = 0.9)
+res_us_pre <- optim(init, garch11_loglik, returns = r_us_pre, method = "L-BFGS-B",
+                    lower = c(1e-6, 0, 0), upper = c(1, 1, 1))
+res_us_post <- optim(init, garch11_loglik, returns = r_us_post, method = "L-BFGS-B",
+                     lower = c(1e-6, 0, 0), upper = c(1, 1, 1))
+
+res_ch_pre <- optim(init, garch11_loglik, returns = r_ch_pre, method = "L-BFGS-B",
+                    lower = c(1e-6, 0, 0), upper = c(1, 1, 1))
+res_ch_post <- optim(init, garch11_loglik, returns = r_ch_post, method = "L-BFGS-B",
+                     lower = c(1e-6, 0, 0), upper = c(1, 1, 1))
+
+
+# Compute variance 
+
+get_sigma2 <- function(params, returns) {
+  omega <- params[1]; alpha <- params[2]; beta <- params[3]
+  n <- length(returns)
+  sigma2 <- rep(var(returns), n)
+  for (t in 2:n) sigma2[t] <- omega + alpha * returns[t-1]^2 + beta * sigma2[t-1]
+  return(sigma2)
+}
+
+sigma_us_pre  <- get_sigma2(res_us_pre$par, r_us_pre)
+sigma_us_post <- get_sigma2(res_us_post$par, r_us_post)
+sigma_ch_pre  <- get_sigma2(res_ch_pre$par, r_ch_pre)
+sigma_ch_post <- get_sigma2(res_ch_post$par, r_ch_post)
+
+```
+
+# Block Bootstrap test function
+
+We cannot just use use a ttest to estimate the volatility. The problem is that the $\sigma_t^2$ values come from a time series, so they are autocorrelated, and a ttest has an independent hypothesis about the observations.
+
+To know if volatility changed between to periods, we will test : 
+
+- $H_0 : E[\hat\sigma_{1,t}^2] = E[\hat\sigma_{2,t}^2]$,
+
+- $H_1 : E[\hat\sigma_{1,t}^2] \neq E[\hat\sigma_{2,t}^2]$.
+
+But the variances are autocorrelated, since by definition they depend on past observations.
+
+We tried to find another way "by hand" to do it.
+In that way, we tried to simulate the null hypothesis empirically by using a bootstrap.
+
+In bootstrap, we resample blocks of consecutive days and then compare the average volatility between groups a lot of time.
+
+We will have as a consequence an empirical result of the differences of volatility and a p-value.
+
+Here is how we proceeded : 
+
+1. We divided each volatility series into blocks of a certain length.
+
+2. We resample randomly these blocks with replacement to form new bootstrap samples.
+
+3. For each bootstrap replication $b=1,…,B$
+b=1,…,B, we compute the difference in mean volatility.
+
+4. The empirical distribution of the difference in mean volatility approximates the null distribution of the test statistic with dependence.
+The p-value is computed : 
+$$
+p = \frac{1}{B} \sum_{b=1}^{B} \mathbb{1}\left( |\Delta^{*(b)}| \geq |\Delta_{\text{obs}}| \right)
+$$
+
+where 
+$$ 
+\Delta_{\text{obs}} = \bar{\sigma}_{1}^{2} - \bar{\sigma}_{2}^{2} 
+$$ 
+is the observed difference in mean volatility, 
+$$
+\Delta^{*(b)} = \bar{\tilde{\sigma}}_{1}^{2*(b)} - \bar{\tilde{\sigma}}_{2}^{2*(b)}
+$$ 
+is the difference in mean volatility and $\tilde{\sigma}_{1,t}^{*(b)}$ 
+and $\tilde{\sigma}_{2,t}^{*(b)}$ are the new bootstrap samples.
+
+
+If the p-value is small ($p<0.5$), we reject $H_0$ and conclude that the average volatility is significantly different between two periods.
+
+```{r}
+block_bootstrap_test <- function(x, y, block_size = 20, nboot = 1000) {
+  n_x <- length(x); n_y <- length(y)
+  mean_diff <- mean(x) - mean(y)
+  diffs <- numeric(nboot)
+  
+  for (i in 1:nboot) {
+    # resample contiguous blocks from each series
+    start_x <- sample(1:(n_x - block_size + 1), 1)
+    start_y <- sample(1:(n_y - block_size + 1), 1)
+    boot_x <- x[start_x:(start_x + block_size - 1)]
+    boot_y <- y[start_y:(start_y + block_size - 1)]
+    diffs[i] <- mean(boot_x) - mean(boot_y)
+  }
+  
+  pval <- mean(abs(diffs) >= abs(mean_diff))
+  return(list(mean_diff = mean_diff, pval = pval, diffs = diffs))
+}
+
+# Run tests
+boot_us_prepost   <- block_bootstrap_test(sigma_us_pre,  sigma_us_post)
+boot_ch_prepost   <- block_bootstrap_test(sigma_ch_pre,  sigma_ch_post)
+boot_us_ch_pre    <- block_bootstrap_test(sigma_us_pre,  sigma_ch_pre)
+boot_us_ch_post   <- block_bootstrap_test(sigma_us_post, sigma_ch_post)
+
+# Function to plot histograms
+plot_boot_hist <- function(result, title, xlab_text) {
+  hist(result$diffs, breaks = 30, main = title,
+       xlab = xlab_text, col = "lightblue", border = "white")
+  abline(v = result$mean_diff, col = "red", lwd = 2)
+  text(result$mean_diff,
+       max(hist(result$diffs, plot = FALSE)$counts) * 0.9,
+       labels = sprintf("Observed diff = %.5f\np = %.3f",
+                        result$mean_diff, result$pval),
+       pos = 4, col = "red")
+}
+
+```
+
+
+# Plots
+
+```{r}
+par(mfrow = c(2,2))
+plot_boot_hist(boot_us_prepost, "US volatility: pre vs post COVID",
+               "Mean diff (pre - post)")
+plot_boot_hist(boot_ch_prepost, "China volatility: pre vs post COVID",
+               "Mean diff (pre - post)")
+plot_boot_hist(boot_us_ch_pre,  "US vs China: pre-COVID",
+               "Mean diff (US - China)")
+plot_boot_hist(boot_us_ch_post, "US vs China: post-COVID",
+               "Mean diff (US - China)")
+par(mfrow = c(1,1))
+
+
+# Attach sigma to their Date vectors
+# Make sure lengths match
+stopifnot(length(sigma_us_pre)  == nrow(data_pre))
+stopifnot(length(sigma_us_post) == nrow(data_post))
+stopifnot(length(sigma_ch_pre)  == nrow(data_pre))
+stopifnot(length(sigma_ch_post) == nrow(data_post))
+
+df_pre  <- data.frame(Date = data_pre$Date,
+                      sigma_us = sigma_us_pre,
+                      sigma_china = sigma_ch_pre,
+                      period = "pre")
+df_post <- data.frame(Date = data_post$Date,
+                      sigma_us = sigma_us_post,
+                      sigma_china = sigma_ch_post,
+                      period = "post")
+
+# Combine
+df_all <- rbind(df_pre, df_post)
+
+# Aggregate duplicates by Date (take mean of values on same Date), this ensures only one value per calendar date
+df_agg <- aggregate(cbind(sigma_us, sigma_china) ~ Date,
+                    data = df_all,
+                    FUN = mean, na.rm = TRUE)
+
+# Add period labeling
+# If the same calendar Date exists in pre & post, aggregated mean will merge them
+df_agg <- df_agg[order(df_agg$Date), ]
+
+# Define cutoff
+cutoff <- as.Date("2020-01-01")
+p2 <- ggplot(df_agg, aes(x = Date)) +
+  geom_rect(aes(xmin = min(Date), xmax = cutoff - 1, ymin = -Inf, ymax = Inf),
+            fill = "lightblue", alpha = 0.08) +
+  geom_rect(aes(xmin = cutoff, xmax = max(Date), ymin = -Inf, ymax = Inf),
+            fill = "pink", alpha = 0.04) +
+  geom_line(aes(y = sigma_us, colour = "US"), size = 0.8) +
+  geom_line(aes(y = sigma_china, colour = "China"), size = 0.8) +
+  geom_vline(xintercept = as.numeric(cutoff), linetype = "dashed") +
+  annotate("text", x = cutoff - 400, y = max(df_agg$sigma_us, na.rm=TRUE)*0.9, label = "Pre-COVID", size=3) +
+  annotate("text", x = cutoff + 400, y = max(df_agg$sigma_us, na.rm=TRUE)*0.9, label = "Post-COVID", size=3) +
+  labs(title = "Estimated conditional variance (sigma^2) with Pre/Post shading",
+       y = expression(hat(sigma)^2),
+       colour = "Series") +
+  theme_minimal()
+print(p2)
+
+# Summary table
+results_table <- data.frame(
+  Comparison = c("US pre vs post",
+                 "China pre vs post",
+                 "US vs China (pre)",
+                 "US vs China (post)"),
+  Mean_Diff = c(boot_us_prepost$mean_diff,
+                boot_ch_prepost$mean_diff,
+                boot_us_ch_pre$mean_diff,
+                boot_us_ch_post$mean_diff),
+  P_Value = c(boot_us_prepost$pval,
+              boot_ch_prepost$pval,
+              boot_us_ch_pre$pval,
+              boot_us_ch_post$pval)
+)
+
+print(results_table)
+```
+```{r}
+params_us_pre  <- res_us_pre$par
+params_us_post <- res_us_post$par
+params_ch_pre  <- res_ch_pre$par
+params_ch_post <- res_ch_post$par
+
+# Function to compute persistence = alpha + beta
+persistence <- function(par) par["alpha"] + par["beta"]
+
+garch_table <- data.frame(
+  Market = c("US", "US", "China", "China"),
+  Period = c("Pre-COVID", "Post-COVID", "Pre-COVID", "Post-COVID"),
+  Omega  = c(params_us_pre["omega"],
+             params_us_post["omega"],
+             params_ch_pre["omega"],
+             params_ch_post["omega"]),
+  Alpha  = c(params_us_pre["alpha"],
+             params_us_post["alpha"],
+             params_ch_pre["alpha"],
+             params_ch_post["alpha"]),
+  Beta   = c(params_us_pre["beta"],
+             params_us_post["beta"],
+             params_ch_pre["beta"],
+             params_ch_post["beta"]),
+  Persistence = c(persistence(params_us_pre),
+                  persistence(params_us_post),
+                  persistence(params_ch_pre),
+                  persistence(params_ch_post))
+)
+
+kable(garch_table, digits = 6,
+      caption = "GARCH(1,1) Parameter Comparison: Pre vs Post COVID") %>%
+  kable_styling(full_width = FALSE, position = "center")
+```
+
+
+
